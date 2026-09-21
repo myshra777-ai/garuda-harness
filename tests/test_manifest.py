@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -141,3 +142,33 @@ def test_non_json_server_info_is_rejected_without_replacing_file(
         manifest.update(server_info={"value": object()})  # type: ignore[dict-item]
 
     assert path.read_text(encoding="utf-8") == before
+
+
+def test_failed_persistence_preserves_state_and_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "run.json"
+    manifest = RunManifest.start(path, run_id="run-1", read_only=True)
+
+    original_data = json.loads(path.read_text(encoding="utf-8"))
+
+    def mock_replace(src: str | Path, dst: str | Path) -> None:
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(os, "replace", mock_replace)
+
+    with pytest.raises(OSError, match="simulated disk failure"):
+        manifest.update(event_count=5)
+
+    assert manifest.snapshot()["event_count"] == 0
+    assert json.loads(path.read_text(encoding="utf-8")) == original_data
+
+    files = list(tmp_path.iterdir())
+    assert len(files) == 1
+    assert files[0].name == "run.json"
+
+    monkeypatch.undo()
+    manifest.update(event_count=10)
+
+    assert manifest.snapshot()["event_count"] == 10
+    assert json.loads(path.read_text(encoding="utf-8"))["event_count"] == 10

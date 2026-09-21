@@ -34,24 +34,22 @@ class RunManifest:
         if not run_id:
             raise ValueError("run_id must not be empty")
 
-        manifest = cls(
-            path,
-            {
-                "schema_version": MANIFEST_SCHEMA_VERSION,
-                "run_id": run_id,
-                "status": "running",
-                "read_only": read_only,
-                "started_at": _utc_now(),
-                "finished_at": None,
-                "protocol_version": None,
-                "server_info": {},
-                "journal_path": None,
-                "event_count": 0,
-                "error": None,
-                "error_truncated": False,
-            },
-        )
-        manifest._write()
+        initial_data: dict[str, JSONValue] = {
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "run_id": run_id,
+            "status": "running",
+            "read_only": read_only,
+            "started_at": _utc_now(),
+            "finished_at": None,
+            "protocol_version": None,
+            "server_info": {},
+            "journal_path": None,
+            "event_count": 0,
+            "error": None,
+            "error_truncated": False,
+        }
+        manifest = cls(path, initial_data)
+        manifest._write(initial_data)
         return manifest
 
     def update(
@@ -62,28 +60,31 @@ class RunManifest:
         journal_path: str | None = None,
         event_count: int | None = None,
     ) -> None:
+        candidate = _copy_json_object(self._data)
+
         if protocol_version is not None:
             if not protocol_version:
                 raise ValueError("protocol_version must not be empty")
-            self._data["protocol_version"] = protocol_version
+            candidate["protocol_version"] = protocol_version
 
         if server_info is not None:
-            self._data["server_info"] = _copy_json_object(server_info)
+            candidate["server_info"] = _copy_json_object(server_info)
 
         if journal_path is not None:
             if not journal_path:
                 raise ValueError("journal_path must not be empty")
-            self._data["journal_path"] = journal_path
+            candidate["journal_path"] = journal_path
 
         if event_count is not None:
             if event_count < 0:
                 raise ValueError("event_count must not be negative")
-            self._data["event_count"] = event_count
+            candidate["event_count"] = event_count
 
-        self._write()
+        self._write(candidate)
+        self._data = candidate
 
     def finish(self, status: str, error: str | None = None) -> None:
-        if status not in VALID_STATUSES or status == "running":
+        if status not in TERMINAL_STATUSES:
             raise ValueError(
                 "final status must be succeeded, failed, or cancelled"
             )
@@ -98,19 +99,22 @@ class RunManifest:
         if status == "succeeded" and error is not None:
             raise ValueError("succeeded manifests cannot include an error")
 
+        candidate = _copy_json_object(self._data)
         bounded_error, truncated = _bound_error(error)
-        self._data["status"] = status
-        self._data["finished_at"] = _utc_now()
-        self._data["error"] = bounded_error
-        self._data["error_truncated"] = truncated
-        self._write()
+        candidate["status"] = status
+        candidate["finished_at"] = _utc_now()
+        candidate["error"] = bounded_error
+        candidate["error_truncated"] = truncated
+
+        self._write(candidate)
+        self._data = candidate
 
     def snapshot(self) -> dict[str, JSONValue]:
         return _copy_json_object(self._data)
 
-    def _write(self) -> None:
+    def _write(self, data: Mapping[str, JSONValue]) -> None:
         encoded = json.dumps(
-            self._data,
+            data,
             ensure_ascii=False,
             separators=(",", ":"),
             allow_nan=False,
