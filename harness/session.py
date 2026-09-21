@@ -12,6 +12,27 @@ from .tools import ToolRegistry
 EXPECTED_PROTOCOL_VERSION = "2025-06-18"
 
 
+@dataclass(frozen=True)
+class ToolCallResult:
+    tool_name: str
+    response: MCPResponse
+
+    @property
+    def is_error(self) -> bool:
+        return self.response.error is not None
+
+    @property
+    def result(self) -> dict[str, Any]:
+        if self.response.error is not None:
+            raise ProtocolError(
+                f"tool {self.tool_name} returned an MCP error: "
+                f"{self.response.error}"
+            )
+        if self.response.result is None:
+            raise ProtocolError(f"tool {self.tool_name} returned no result")
+        return self.response.result
+
+
 @dataclass
 class ReadOnlySession:
     client: MCPStdioClient
@@ -21,21 +42,20 @@ class ReadOnlySession:
 
     def close(self) -> int:
         return self.client.close()
-
     def call_read_only(
         self,
         tool_name: str,
         arguments: dict[str, Any] | None = None,
-    ) -> MCPResponse:
+    ) -> ToolCallResult:
         self.tools.require_read_only(tool_name)
-        return self.client.request(
+        response = self.client.request(
             "tools/call",
             {
                 "name": tool_name,
                 "arguments": arguments or {},
             },
         )
-
+        return ToolCallResult(tool_name=tool_name, response=response)
 
 def open_read_only_session(
     command: list[str],
