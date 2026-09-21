@@ -1,10 +1,14 @@
+import json
 import sys
+from pathlib import Path
+from typing import Any
 
 import pytest
 
 from harness.budgets import BudgetExceeded, CallBudget
 from harness.errors import ProtocolError, ReadOnlyViolation
-from harness.session import open_read_only_session
+from harness.events import EventJournal
+from harness.session import open_read_only_session, result_digest
 from harness.tools import READ_ONLY_TOOLS
 
 FAKE_SERVER = r"""
@@ -255,5 +259,140 @@ def test_budget_is_attached_to_session() -> None:
 
     try:
         assert session.budget is budget
+    finally:
+        assert session.close() == 0
+
+
+def test_result_digest_is_canonical() -> None:
+    result_1 = {"b": 2, "a": 1}
+    result_2 = {"a": 1, "b": 2}
+    assert result_digest(result_1) == result_digest(result_2)
+
+
+def test_session_journals_redacted_call_and_digest_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal_path = tmp_path / "events.jsonl"
+    journal = EventJournal(journal_path)
+
+    def mock_redact(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {"allowlisted": True, "original_keys": list(args.keys())}
+
+    monkeypatch.setattr("harness.session.redact_tool_arguments", mock_redact)
+
+    session = open_read_only_session(
+        fake_command(),
+        journal=journal,
+        run_id="run-test",
+    )
+
+    try:
+        session.call_read_only("garuda.entities", {"workspace": "fixture"})
+
+        events = [
+            json.loads(line)
+            for line in journal_path.read_text(encoding="utf-8").splitlines()
+        ]
+
+        assert len(events) == 2
+
+        started = events[0]
+        assert started["event_type"] == "tool_call.started"
+        assert started["payload"]["tool_name"] == "garuda.entities"
+        assert started["payload"]["arguments"] == {
+            "allowlisted": True,
+            "original_keys": ["workspace"],
+        }
+
+        completed = events[1]
+        assert completed["event_type"] == "tool_call.completed"
+        assert completed["payload"]["tool_name"] == "garuda.entities"
+        assert completed["payload"]["status"] == "ok"
+        assert "result_digest" in completed["payload"]
+        assert completed["payload"]["result_bytes"] > 0
+        assert "result" not in completed["payload"]
+
+    finally:
+        assert session.close() == 0
+
+
+def test_session_journals_tool_failure(tmp_path: Path) -> None:
+    journal_path = tmp_path / "events.jsonl"
+    journal = EventJournal(journal_path)
+
+    error_server = FAKE_SERVER.replace(
+        'result = {\n            "content": [\n                {\n                    "type": "text",\n                    "text": json.dumps({"status": "ok"}),\n                }\n            ]\n        }',
+        'result = {"error": "fixture failure"}',
+        1,
+    )
+
+    session = open_read_only_session(
+        [sys.executable, "-u", "-c", error_server],
+        journal=journal,
+        run_id="run-fail",
+    )
+
+    try:
+        session.call_read_only("garuda.entities", {})
+
+        events = [
+            json.loads(line)
+            for line in journal_path.read_text(encoding="utf-8").splitlines()
+        ]
+
+        assert len(events) == 2
+        assert events[0]["event_type"] == "tool_call.started"
+        assert events[1]["event_type"] == "tool_call.failed"
+        assert events[1]["payload"]["tool_name"] == "garuda.entities"
+        assert events[1]["payload"]["error"] == "fixture failure"
+
+    finally:
+        assert session.close() == 0
+
+
+def test_budget_rejection_emits_no_transport_call_or_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal_path = tmp_path / "events.jsonl"
+    journal = EventJournal(journal_path)
+    budget = CallBudget(max_calls=1)
+
+    def mock_redact(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    monkeypatch.setattr("harness.session.redact_tool_arguments", mock_redact)
+
+    session = open_read_only_session(
+        fake_command(),
+        budget=budget,
+        journal=journal,
+        run_id="run-budget",
+    )
+
+    try:
+        session.call_read_only("garuda.entities", {})
+
+        with pytest.raises(BudgetExceeded):
+            session.call_read_only("garuda.entities", {"workspace": "two"})
+
+        events = [
+            json.loads(line)
+            for line in journal_path.read_text(encoding="utf-8").splitlines()
+        ]
+
+        assert len(events) == 2
+        assert events[0]["event_type"] == "tool_call.started"
+        assert events[1]["event_type"] == "tool_call.completed"
+
+    finally:
+        assert session.close() == 0
+
+
+def test_existing_sessions_without_journal_still_work() -> None:
+    session = open_read_only_session(fake_command())
+
+    try:
+        call = session.call_read_only("garuda.entities", {"workspace": "fixture"})
+        assert call.is_error is False
     finally:
         assert session.close() == 0

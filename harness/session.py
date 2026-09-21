@@ -2,16 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any
 
 from harness.budgets import CallBudget
+from harness.events import EventJournal
+from harness.redaction import redact_tool_arguments
 
 from .errors import ProtocolError
 from .protocol import MCPResponse, MCPStdioClient
 from .tools import ToolRegistry
 
 EXPECTED_PROTOCOL_VERSION = "2025-06-18"
+
+
+def result_digest(result: dict[str, Any]) -> str:
+    """Returns a deterministic SHA-256 digest of canonical JSON."""
+    encoded = json.dumps(
+        result,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -42,6 +58,8 @@ class ReadOnlySession:
     protocol_version: str
     server_info: dict[str, Any]
     budget: CallBudget | None = None
+    journal: EventJournal | None = None
+    run_id: str | None = None
 
     def close(self) -> int:
         return self.client.close()
@@ -57,6 +75,17 @@ class ReadOnlySession:
         if self.budget is not None:
             self.budget.before_call(tool_name, safe_args)
 
+        if self.journal is not None and self.run_id is not None:
+            redacted_args = redact_tool_arguments(tool_name, safe_args)
+            self.journal.append(
+                self.run_id,
+                "tool_call.started",
+                {
+                    "tool_name": tool_name,
+                    "arguments": redacted_args,
+                },
+            )
+
         response = self.client.request(
             "tools/call",
             {
@@ -65,8 +94,50 @@ class ReadOnlySession:
             },
         )
 
-        if self.budget is not None and response.result is not None:
-            self.budget.record_result(response.result)
+        # Handle both JSON-RPC protocol errors and tool-level execution errors
+        error_detail = None
+        res = response.result if response.result is not None else {}
+
+        if response.error is not None:
+            error_detail = response.error
+        elif "error" in res:
+            error_detail = res["error"]
+        elif res.get("isError") is True:
+            error_detail = res
+
+        if error_detail is not None:
+            if self.journal is not None and self.run_id is not None:
+                self.journal.append(
+                    self.run_id,
+                    "tool_call.failed",
+                    {
+                        "tool_name": tool_name,
+                        "error": error_detail,
+                    },
+                )
+        else:
+            encoded = json.dumps(
+                res,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+            result_bytes = len(encoded)
+
+            if self.budget is not None:
+                self.budget.record_result(res)
+
+            if self.journal is not None and self.run_id is not None:
+                self.journal.append(
+                    self.run_id,
+                    "tool_call.completed",
+                    {
+                        "tool_name": tool_name,
+                        "status": "ok",
+                        "result_bytes": result_bytes,
+                        "result_digest": result_digest(res),
+                    },
+                )
 
         return ToolCallResult(tool_name=tool_name, response=response)
 
@@ -77,6 +148,8 @@ def open_read_only_session(
     client_name: str = "garuda-harness",
     client_version: str = "0.1.0",
     budget: CallBudget | None = None,
+    journal: EventJournal | None = None,
+    run_id: str | None = None,
 ) -> ReadOnlySession:
     client = MCPStdioClient(command, env=env)
     client.start()
@@ -118,6 +191,8 @@ def open_read_only_session(
             protocol_version=protocol_version,
             server_info=server_info,
             budget=budget,
+            journal=journal,
+            run_id=run_id,
         )
     except Exception:
         client.close()
