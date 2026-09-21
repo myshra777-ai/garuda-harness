@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from harness.budgets import CallBudget
+
 from .errors import ProtocolError
 from .protocol import MCPResponse, MCPStdioClient
 from .tools import ToolRegistry
@@ -39,29 +41,42 @@ class ReadOnlySession:
     tools: ToolRegistry
     protocol_version: str
     server_info: dict[str, Any]
+    budget: CallBudget | None = None
 
     def close(self) -> int:
         return self.client.close()
+
     def call_read_only(
         self,
         tool_name: str,
         arguments: dict[str, Any] | None = None,
     ) -> ToolCallResult:
         self.tools.require_read_only(tool_name)
+        safe_args = arguments or {}
+
+        if self.budget is not None:
+            self.budget.before_call(tool_name, safe_args)
+
         response = self.client.request(
             "tools/call",
             {
                 "name": tool_name,
-                "arguments": arguments or {},
+                "arguments": safe_args,
             },
         )
+
+        if self.budget is not None and response.result is not None:
+            self.budget.record_result(response.result)
+
         return ToolCallResult(tool_name=tool_name, response=response)
+
 
 def open_read_only_session(
     command: list[str],
     env: dict[str, str] | None = None,
     client_name: str = "garuda-harness",
     client_version: str = "0.1.0",
+    budget: CallBudget | None = None,
 ) -> ReadOnlySession:
     client = MCPStdioClient(command, env=env)
     client.start()
@@ -102,6 +117,7 @@ def open_read_only_session(
             tools=registry,
             protocol_version=protocol_version,
             server_info=server_info,
+            budget=budget,
         )
     except Exception:
         client.close()
