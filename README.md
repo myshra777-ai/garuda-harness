@@ -1,6 +1,3 @@
-<<<<<<< HEAD
-# garuda-harness
-=======
 # Garuda Harness
 
 A provider-neutral execution and continuity layer for Garuda.
@@ -85,4 +82,3 @@ garuda.resume
 ```
 
 It must also reject arbitrary subprocess execution and filesystem mutation until a later phase explicitly introduces a Tool Broker and sandbox contract.
->>>>>>> 0e13255 (chore: add Garuda Harness repository foundation)
