@@ -107,12 +107,12 @@ def test_read_only_tool_call_is_allowed() -> None:
     session = open_read_only_session(fake_command())
 
     try:
-        response = session.call_read_only(
+        call = session.call_read_only(
             "garuda.entities",
             {"workspace": "fixture"},
         )
-        assert response.error is None
-        assert response.result is not None
+        assert call.is_error is False
+        assert call.result["content"][0]["type"] == "text"
     finally:
         assert session.close() == 0
 
@@ -149,3 +149,36 @@ def test_missing_required_tool_is_rejected() -> None:
 
     with pytest.raises(ProtocolError, match="missing required read-only tools"):
         open_read_only_session(session_command)
+
+def test_read_only_call_result_exposes_result() -> None:
+    session = open_read_only_session(fake_command())
+
+    try:
+        call = session.call_read_only(
+            "garuda.entities",
+            {"workspace": "fixture"},
+        )
+
+        assert call.tool_name == "garuda.entities"
+        assert call.is_error is False
+        assert call.result["content"][0]["type"] == "text"
+    finally:
+        assert session.close() == 0
+
+
+def test_tool_error_is_preserved() -> None:
+    error_server = FAKE_SERVER.replace(
+        'result = {\n            "content": [\n                {\n                    "type": "text",\n                    "text": json.dumps({"status": "ok"}),\n                }\n            ]\n        }',
+        'result = {"error": "fixture failure"}',
+        1,
+    )
+    session = open_read_only_session(
+        [sys.executable, "-u", "-c", error_server]
+    )
+
+    try:
+        call = session.call_read_only("garuda.entities", {})
+        assert call.is_error is False
+        assert call.result["error"] == "fixture failure"
+    finally:
+        assert session.close() == 0
