@@ -4,6 +4,107 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
+from typing import Any
+
+from harness.budgets import BudgetExceeded, CallBudget
+from harness.errors import ProtocolError
+from harness.events import EventJournal
+from harness.manifest import RunManifest
+from harness.session import open_read_only_session
+
+
+class ReadOnlyController:
+    """Orchestrates an end-to-end bounded, read-only harness run."""
+
+    def __init__(
+        self,
+        run_id: str,
+        workspace_dir: Path,
+        command: list[str],
+        env: dict[str, str] | None = None,
+        budget: CallBudget | None = None,
+    ) -> None:
+        self.run_id = run_id
+        self.workspace_dir = Path(workspace_dir)
+        self.command = command
+        self.env = env
+        self.budget = budget or CallBudget()
+
+    def run(self, sequence: list[tuple[str, dict[str, Any]]]) -> None:
+        """
+        Executes a bounded sequence of tool calls securely.
+        """
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = self.workspace_dir / "run.json"
+        journal_path = self.workspace_dir / "events.jsonl"
+
+        manifest = RunManifest.start(manifest_path, self.run_id, read_only=True)
+        journal = EventJournal(journal_path)
+
+        command_name = self.command[0] if self.command else "unknown"
+        journal.append(
+            self.run_id,
+            "run.started",
+            {
+                "command_name": command_name,
+                "command_length": len(self.command),
+                "sequence_length": len(sequence),
+            },
+        )
+
+        try:
+            session = open_read_only_session(
+                command=self.command,
+                env=self.env,
+                budget=self.budget,
+                journal=journal,
+                run_id=self.run_id,
+            )
+        except ProtocolError:
+            manifest.finish("failed", "session initialization failed: protocol error")
+            journal.append(
+                self.run_id,
+                "run.failed",
+                {"error": "session initialization failed: protocol error"},
+            )
+            raise
+        except Exception:
+            manifest.finish("failed", "session initialization failed")
+            journal.append(
+                self.run_id,
+                "run.failed",
+                {"error": "session initialization failed"},
+            )
+            raise
+
+        try:
+            manifest.update(
+                protocol_version=session.protocol_version,
+                server_info=session.server_info,
+                journal_path=journal_path.name,
+                event_count=self.budget.call_count,
+            )
+
+            for tool_name, arguments in sequence:
+                session.call_read_only(tool_name, arguments)
+
+            manifest.update(event_count=self.budget.call_count)
+            manifest.finish("succeeded")
+            journal.append(self.run_id, "run.succeeded", {})
+
+        except BudgetExceeded:
+            manifest.update(event_count=self.budget.call_count)
+            manifest.finish("cancelled", "budget exceeded")
+            journal.append(self.run_id, "run.cancelled", {"reason": "budget exceeded"})
+            raise
+        except Exception:
+            manifest.update(event_count=self.budget.call_count)
+            manifest.finish("failed", "execution failed")
+            journal.append(self.run_id, "run.failed", {"error": "execution failed"})
+            raise
+        finally:
+            session.close()
 
 
 def build_parser() -> argparse.ArgumentParser:

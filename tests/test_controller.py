@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from harness.budgets import BudgetExceeded, CallBudget
-from harness.controller import ReadOnlyController
+from harness.controller import ReadOnlyController, main
 from harness.errors import ProtocolError, TransportError
 from tests.test_session import FAKE_SERVER
 
@@ -42,6 +42,9 @@ def test_controller_executes_happy_path(tmp_path: Path) -> None:
     assert "tool_call.completed" in event_types
     assert event_types[-1] == "run.succeeded"
 
+    # Assert no raw result payload leaked into the journal
+    assert all("result" not in event.get("payload", {}) for event in events)
+
 
 def test_controller_cancels_on_budget_exhaustion(tmp_path: Path) -> None:
     cmd = fake_command(tmp_path)
@@ -67,7 +70,6 @@ def test_controller_cancels_on_budget_exhaustion(tmp_path: Path) -> None:
 
 
 def test_controller_fails_on_transport_error(tmp_path: Path) -> None:
-    # A script that just exits causes a TransportError (broken pipe), not a ProtocolError
     cmd = [sys.executable, "-u", "-c", "import sys; sys.exit(1)"]
     controller = ReadOnlyController("run-3", tmp_path, cmd)
 
@@ -84,7 +86,6 @@ def test_controller_fails_on_transport_error(tmp_path: Path) -> None:
 
 
 def test_controller_fails_on_protocol_error(tmp_path: Path) -> None:
-    # A script that returns an invalid MCP protocol version causes a ProtocolError
     bad_server = FAKE_SERVER.replace('"2025-06-18"', '"9999-01-01"', 1)
     script = tmp_path / "bad_mcp.py"
     script.write_text(bad_server, encoding="utf-8")
@@ -103,3 +104,10 @@ def test_controller_fails_on_protocol_error(tmp_path: Path) -> None:
     events = [json.loads(line) for line in journal_text.splitlines()]
     assert events[-1]["event_type"] == "run.failed"
     assert events[-1]["payload"]["error"] == "session initialization failed: protocol error"
+
+
+def test_controller_preserves_cli_contract() -> None:
+    assert main([]) == 0
+    assert main(["check"]) == 0
+    assert main(["run"]) == 2
+    assert main(["run", "--read-only"]) == 0
