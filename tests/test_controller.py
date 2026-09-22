@@ -42,8 +42,16 @@ def test_controller_executes_happy_path(tmp_path: Path) -> None:
     assert "tool_call.completed" in event_types
     assert event_types[-1] == "run.succeeded"
 
-    # Assert no raw result payload leaked into the journal
-    assert all("result" not in event.get("payload", {}) for event in events)
+    # Assert exactly bounded payload fields to prove no raw results leaked
+    completed = next(
+        event for event in events if event["event_type"] == "tool_call.completed"
+    )
+    assert set(completed["payload"]) == {
+        "tool_name",
+        "status",
+        "result_bytes",
+        "result_digest",
+    }
 
 
 def test_controller_cancels_on_budget_exhaustion(tmp_path: Path) -> None:
