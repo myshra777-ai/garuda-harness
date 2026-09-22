@@ -6,12 +6,23 @@ import argparse
 import sys
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from harness.budgets import BudgetExceeded, CallBudget
-from harness.errors import ProtocolError
+from harness.errors import HarnessError, ProtocolError, TransportError
 from harness.events import EventJournal
 from harness.manifest import RunManifest
 from harness.session import open_read_only_session
+
+
+def _validate_sequence(
+    sequence: list[tuple[str, dict[str, Any]]],
+) -> None:
+    for tool_name, arguments in sequence:
+        if not isinstance(tool_name, str) or not tool_name:
+            raise ValueError("tool names must be non-empty strings")
+        if not isinstance(arguments, dict):
+            raise TypeError("tool arguments must be dictionaries")
 
 
 class ReadOnlyController:
@@ -35,6 +46,8 @@ class ReadOnlyController:
         """
         Executes a bounded sequence of tool calls securely.
         """
+        _validate_sequence(sequence)
+
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = self.workspace_dir / "run.json"
         journal_path = self.workspace_dir / "events.jsonl"
@@ -112,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="garuda-harness",
         description="Read-only execution and continuity harness for Garuda.",
     )
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_subparsers(dest="action")
 
     subparsers.add_parser(
         "check",
@@ -128,6 +141,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Require read-only mode.",
+    )
+    run_parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Run identifier; generated when omitted.",
+    )
+    run_parser.add_argument(
+        "--workspace",
+        type=Path,
+        default=Path(".garuda-harness"),
+        help="Directory for run artifacts.",
+    )
+    run_parser.add_argument(
+        "--max-calls",
+        type=int,
+        default=10,
+        help="Maximum number of read-only tool calls.",
+    )
+    run_parser.add_argument(
+        "server_command",
+        nargs=argparse.REMAINDER,
+        help="MCP server command, preceded by --.",
     )
 
     replay_parser = subparsers.add_parser(
@@ -146,17 +181,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command is None:
+    if args.action is None:
         parser.print_help()
         return 0
 
-    if args.command == "check":
+    if args.action == "check":
         print("H1 controller configuration: OK")
         print("Mode: read-only")
         print("Mutation: disabled")
         return 0
 
-    if args.command == "run":
+    if args.action == "run":
         if not args.read_only:
             print(
                 "refusing to run without --read-only; "
@@ -164,15 +199,57 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
-        print("H1 read-only controller is not connected yet.")
-        print("Transport implementation is the next step.")
+
+        if args.max_calls < 1:
+            print("--max-calls must be positive", file=sys.stderr)
+            return 2
+
+        if not args.server_command:
+            print(
+                "H1 read-only controller requires an MCP command "
+                "after '--'.",
+                file=sys.stderr,
+            )
+            return 2
+
+        command = args.server_command
+        if command[0] == "--":
+            command = command[1:]
+
+        if not command:
+            print(
+                "H1 read-only controller requires an MCP command "
+                "after '--'.",
+                file=sys.stderr,
+            )
+            return 2
+
+        run_id = args.run_id or f"run-{uuid4().hex[:12]}"
+        controller = ReadOnlyController(
+            run_id=run_id,
+            workspace_dir=args.workspace,
+            command=command,
+            budget=CallBudget(max_calls=args.max_calls),
+        )
+
+        try:
+            controller.run([])
+        except BudgetExceeded:
+            return 3
+        except ProtocolError:
+            return 4
+        except TransportError:
+            return 5
+        except HarnessError:
+            return 1
+
         return 0
 
-    if args.command == "replay":
+    if args.action == "replay":
         print(f"Replay implementation is not available yet: {args.journal}")
         return 0
 
-    parser.error(f"unknown command: {args.command}")
+    parser.error(f"unknown command: {args.action}")
     return 2
 
 

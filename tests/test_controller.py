@@ -78,6 +78,7 @@ def test_controller_cancels_on_budget_exhaustion(tmp_path: Path) -> None:
 
 
 def test_controller_fails_on_transport_error(tmp_path: Path) -> None:
+    # A script that just exits causes a TransportError (broken pipe), not a ProtocolError
     cmd = [sys.executable, "-u", "-c", "import sys; sys.exit(1)"]
     controller = ReadOnlyController("run-3", tmp_path, cmd)
 
@@ -94,6 +95,7 @@ def test_controller_fails_on_transport_error(tmp_path: Path) -> None:
 
 
 def test_controller_fails_on_protocol_error(tmp_path: Path) -> None:
+    # A script that returns an invalid MCP protocol version causes a ProtocolError
     bad_server = FAKE_SERVER.replace('"2025-06-18"', '"9999-01-01"', 1)
     script = tmp_path / "bad_mcp.py"
     script.write_text(bad_server, encoding="utf-8")
@@ -114,8 +116,83 @@ def test_controller_fails_on_protocol_error(tmp_path: Path) -> None:
     assert events[-1]["payload"]["error"] == "session initialization failed: protocol error"
 
 
+def test_controller_rejects_invalid_sequence_types(tmp_path: Path) -> None:
+    cmd = fake_command(tmp_path)
+    controller = ReadOnlyController("run-invalid", tmp_path, cmd)
+
+    with pytest.raises(ValueError, match="non-empty strings"):
+        controller.run([("", {})])  # type: ignore[list-item]
+
+    with pytest.raises(TypeError, match="must be dictionaries"):
+        controller.run([("garuda.briefing", [])])  # type: ignore[list-item]
+
+
 def test_controller_preserves_cli_contract() -> None:
     assert main([]) == 0
     assert main(["check"]) == 0
     assert main(["run"]) == 2
-    assert main(["run", "--read-only"]) == 0
+    assert main(["run", "--read-only"]) == 2
+
+
+def test_cli_initialization_smoke_test(tmp_path: Path) -> None:
+    cmd = fake_command(tmp_path)
+    workspace = tmp_path / "artifacts"
+
+    assert (
+        main(
+            [
+                "run",
+                "--read-only",
+                "--workspace",
+                str(workspace),
+                "--run-id",
+                "cli-run",
+                "--max-calls",
+                "1",
+                "--",
+                *cmd,
+            ]
+        )
+        == 0
+    )
+
+    manifest = json.loads((workspace / "run.json").read_text(encoding="utf-8"))
+    assert manifest["run_id"] == "cli-run"
+    assert manifest["status"] == "succeeded"
+    assert manifest["read_only"] is True
+
+
+def test_cli_rejects_non_positive_budget(tmp_path: Path) -> None:
+    cmd = fake_command(tmp_path)
+    assert (
+        main(
+            [
+                "run",
+                "--read-only",
+                "--max-calls",
+                "0",
+                "--",
+                *cmd,
+            ]
+        )
+        == 2
+    )
+
+
+def test_cli_maps_transport_error(tmp_path: Path) -> None:
+    assert (
+        main(
+            [
+                "run",
+                "--read-only",
+                "--workspace",
+                str(tmp_path),
+                "--",
+                sys.executable,
+                "-u",
+                "-c",
+                "import sys; sys.exit(1)",
+            ]
+        )
+        == 5
+    )
